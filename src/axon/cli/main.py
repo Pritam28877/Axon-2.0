@@ -9,10 +9,13 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from axon import __version__
+
+load_dotenv()
 
 console = Console()
 

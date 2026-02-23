@@ -24,6 +24,8 @@ class NodeLabel(Enum):
     ENUM = "enum"
     COMMUNITY = "community"
     PROCESS = "process"
+    AST_NODE = "ast_node"
+    VARIABLE = "variable"
 
 class RelType(Enum):
     """Relationship types connecting graph nodes."""
@@ -39,6 +41,10 @@ class RelType(Enum):
     USES_TYPE = "uses_type"
     EXPORTS = "exports"
     COUPLED_WITH = "coupled_with"
+    PARENT_OF = "parent_of"
+    FLOWS_TO = "flows_to"
+    READS = "reads"
+    WRITES = "writes"
 
 def generate_id(label: NodeLabel, file_path: str, symbol_name: str = "") -> str:
     """Produce a deterministic node ID.

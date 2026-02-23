@@ -11,6 +11,8 @@ richness that makes embedding worthwhile.
 
 from __future__ import annotations
 
+import os
+
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -29,6 +31,7 @@ def _get_model(model_name: str) -> TextEmbedding:
 
     return TextEmbedding(model_name=model_name)
 
+
 # Labels worth embedding — skip Folder, Community, Process (structural only).
 EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
     {
@@ -44,7 +47,7 @@ EMBEDDABLE_LABELS: frozenset[NodeLabel] = frozenset(
 
 def embed_graph(
     graph: KnowledgeGraph,
-    model_name: str = "BAAI/bge-small-en-v1.5",
+    model_name: str | None = None,
     batch_size: int = 64,
 ) -> list[NodeEmbedding]:
     """Generate embeddings for all embeddable nodes in the graph.
@@ -56,7 +59,7 @@ def embed_graph(
     Args:
         graph: The knowledge graph whose nodes should be embedded.
         model_name: The fastembed model identifier.  Defaults to
-            ``"BAAI/bge-small-en-v1.5"``.
+            ``AXON_EMBEDDING_MODEL`` or ``"BAAI/bge-small-en-v1.5"``.
         batch_size: Number of texts to encode per batch.  Defaults to 64.
 
     Returns:
@@ -64,6 +67,9 @@ def embed_graph(
         each carrying the node's ID and its embedding vector as a plain
         Python ``list[float]``.
     """
+    if model_name is None:
+        model_name = os.getenv("AXON_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
     nodes = [n for n in graph.iter_nodes() if n.label in EMBEDDABLE_LABELS]
 
     if not nodes:

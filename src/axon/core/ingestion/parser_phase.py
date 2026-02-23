@@ -9,6 +9,7 @@ to Symbol.
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -22,7 +23,7 @@ from axon.core.graph.model import (
     generate_id,
 )
 from axon.core.ingestion.walker import FileEntry
-from axon.core.parsers.base import LanguageParser, ParseResult
+from axon.core.parsers.base import LanguageParser, ParseResult, AstNodeInfo
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ _KIND_TO_LABEL: dict[str, NodeLabel] = {
     "interface": NodeLabel.INTERFACE,
     "type_alias": NodeLabel.TYPE_ALIAS,
     "enum": NodeLabel.ENUM,
+    "variable": NodeLabel.VARIABLE,
 }
 
 @dataclass
@@ -80,10 +82,17 @@ def get_parser(language: str) -> LanguageParser:
         parser = TypeScriptParser(dialect="javascript")
 
     else:
-        raise ValueError(
-            f"Unsupported language {language!r}. "
-            f"Expected one of: python, typescript, javascript"
-        )
+        # Check for universal parser support
+        from axon.config.languages import LANGUAGES
+        from axon.core.parsers.universal import UniversalParser
+
+        if language in LANGUAGES:
+            parser = UniversalParser(LANGUAGES[language])
+        else:
+            raise ValueError(
+                f"Unsupported language {language!r}. "
+                f"Expected one of: {', '.join(LANGUAGES.keys())}"
+            )
 
     _PARSER_CACHE[language] = parser
     return parser
@@ -132,11 +141,14 @@ def process_parsing(
         graph: The knowledge graph to populate.  File nodes are expected to
             already exist (created by the structure phase).
         max_workers: Maximum number of threads for parallel parsing.
+            Defaults to ``AXON_THREADS`` env var or 8.
 
     Returns:
         A list of :class:`FileParseData` objects that carry the full parse
         results (imports, calls, heritage, type_refs) for use by later phases.
     """
+    if max_workers == 8:  # If default is passed, check env
+        max_workers = int(os.getenv("AXON_THREADS", "8"))
     # Phase 1: Parse all files in parallel.
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         all_parse_data = list(
@@ -157,6 +169,7 @@ def process_parsing(
             if kind == "extends":
                 class_bases.setdefault(cls_name, []).append(parent_name)
 
+        # Map symbol nodes
         for symbol in parse_data.parse_result.symbols:
             label = _KIND_TO_LABEL.get(symbol.kind)
             if label is None:
@@ -196,21 +209,61 @@ def process_parsing(
                     end_line=symbol.end_line,
                     content=symbol.content,
                     signature=symbol.signature,
-                    class_name=symbol.class_name,
                     language=file_entry.language,
+                    class_name=symbol.class_name,
                     is_exported=is_exported,
                     properties=props,
                 )
             )
 
-            rel_id = f"defines:{file_id}->{symbol_id}"
             graph.add_relationship(
                 GraphRelationship(
-                    id=rel_id,
+                    id=f"{file_id}->{symbol_id}",
                     type=RelType.DEFINES,
                     source=file_id,
                     target=symbol_id,
                 )
             )
+        
+        # Phase 2.5: AST Nodes
+        for node in parse_data.parse_result.ast_nodes:
+            _add_ast_node(graph, node, file_id, file_entry.path, file_entry.language)
 
     return all_parse_data
+
+
+def _add_ast_node(
+    graph: KnowledgeGraph,
+    node: AstNodeInfo,
+    parent_id: str,
+    file_path: str,
+    language: str,
+) -> None:
+    """Recursively add AST nodes to the graph."""
+    # Unique ID based on location + content hash
+    node_id = f"{NodeLabel.AST_NODE.value}:{file_path}:{node.start_line}:{abs(hash(node.content))}"
+    
+    graph.add_node(
+        GraphNode(
+            id=node_id,
+            label=NodeLabel.AST_NODE,
+            name=node.kind,
+            file_path=file_path,
+            start_line=node.start_line,
+            end_line=node.end_line,
+            content=node.content,
+            language=language,
+        )
+    )
+    
+    graph.add_relationship(
+        GraphRelationship(
+            id=f"{parent_id}->{node_id}",
+            type=RelType.PARENT_OF,
+            source=parent_id,
+            target=node_id,
+        )
+    )
+    
+    for child in node.children:
+        _add_ast_node(graph, child, node_id, file_path, language)

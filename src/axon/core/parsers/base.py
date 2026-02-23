@@ -50,6 +50,16 @@ class TypeRef:
     param_name: str = ""  # for param types: the parameter name
 
 @dataclass
+class AstNodeInfo:
+    """A generic AST node (block, control flow, etc.) for CPG construction."""
+
+    kind: str  # "block", "if", "for", "variable_decl"
+    start_line: int
+    end_line: int
+    content: str
+    children: list[AstNodeInfo] = field(default_factory=list)  # Recursive structure
+
+@dataclass
 class ParseResult:
     """Complete parse result for a single file."""
 
@@ -61,6 +71,7 @@ class ParseResult:
         default_factory=list
     )  # (class_name, kind, parent_name) where kind is "extends" or "implements"
     exports: list[str] = field(default_factory=list)  # names from __all__ or export statements
+    ast_nodes: list[AstNodeInfo] = field(default_factory=list)  # Top-level AST nodes
 
 class LanguageParser(ABC):
     """Base interface for language-specific parsers."""
