@@ -39,7 +39,7 @@ from axon.core.ingestion.processes import process_processes
 from axon.core.ingestion.structure import process_structure
 from axon.core.ingestion.types import process_types
 from axon.core.ingestion.walker import FileEntry, walk_repo
-from axon.core.storage.base import StorageBackend
+from axon.core.storage.base import StorageBackend, refresh_search_indexes
 
 @dataclass
 class PipelineResult:
@@ -199,7 +199,7 @@ def reindex_files(
 
     storage.add_nodes(list(graph.iter_nodes()))
     storage.add_relationships(list(graph.iter_relationships()))
-    storage.rebuild_fts_indexes()
+    refresh_search_indexes(storage)
 
     return graph
 

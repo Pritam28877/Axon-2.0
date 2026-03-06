@@ -18,7 +18,7 @@ from pathlib import Path
 from axon.config.ignore import load_gitignore, should_ignore
 from axon.config.languages import is_supported
 from axon.core.ingestion.walker import FileEntry, read_file
-from axon.core.storage.base import StorageBackend
+from axon.core.storage.base import StorageBackend, refresh_search_indexes
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +42,14 @@ def _reindex_files(
     from axon.core.ingestion.pipeline import reindex_files
 
     entries: list[FileEntry] = []
+    deleted_files = 0
     for abs_path in changed_paths:
         if not abs_path.is_file():
             # File was deleted — remove from storage.
             try:
                 relative = str(abs_path.relative_to(repo_path))
                 storage.remove_nodes_by_file(relative)
+                deleted_files += 1
             except (ValueError, OSError):
                 pass
             continue
@@ -69,8 +71,10 @@ def _reindex_files(
 
     if entries:
         reindex_files(entries, repo_path, storage)
+    elif deleted_files:
+        refresh_search_indexes(storage)
 
-    return len(entries)
+    return len(entries) + deleted_files
 
 def _run_global_phases(storage: StorageBackend, repo_path: Path) -> None:
     """Run global analysis phases (communities, processes, dead code).

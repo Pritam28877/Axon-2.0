@@ -119,3 +119,15 @@ class StorageBackend(Protocol):
     def bulk_load(self, graph: KnowledgeGraph) -> None:
         """Replace the entire store contents with *graph*."""
         ...
+
+
+def refresh_search_indexes(storage: StorageBackend) -> None:
+    """Refresh backend-specific search indexes when supported.
+
+    Some backends need an explicit full-text index rebuild after incremental
+    writes or deletions. The base protocol keeps this optional so alternate
+    backends are not forced to implement a no-op method.
+    """
+    rebuild = getattr(storage, "rebuild_fts_indexes", None)
+    if callable(rebuild):
+        rebuild()
