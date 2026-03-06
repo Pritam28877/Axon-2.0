@@ -24,7 +24,8 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Resource, TextContent, Tool
 
-from axon.core.storage.kuzu_backend import KuzuBackend
+from axon.core.storage.base import StorageBackend
+from axon.core.storage.runtime import GraphScope, StorageRuntime, parse_scope
 from axon.mcp.resources import get_dead_code_list, get_overview, get_schema
 from axon.mcp.tools import (
     handle_context,
@@ -40,14 +41,22 @@ logger = logging.getLogger(__name__)
 
 server = Server("axon")
 
-_storage: KuzuBackend | None = None
+_storage: StorageBackend | None = None
+_shared_storage: StorageBackend | None = None
 _lock: asyncio.Lock | None = None
+_runtime: StorageRuntime | None = None
 
 
-def set_storage(storage: KuzuBackend) -> None:
+def set_storage(storage: StorageBackend) -> None:
     """Inject a pre-initialised storage backend (e.g. from ``axon serve --watch``)."""
     global _storage  # noqa: PLW0603
     _storage = storage
+
+
+def set_runtime(runtime: StorageRuntime) -> None:
+    """Inject runtime path resolution for scoped storage."""
+    global _runtime  # noqa: PLW0603
+    _runtime = runtime
 
 
 def set_lock(lock: asyncio.Lock) -> None:
@@ -56,8 +65,16 @@ def set_lock(lock: asyncio.Lock) -> None:
     _lock = lock
 
 
-def _get_storage() -> KuzuBackend:
-    """Lazily initialise and return the KuzuDB storage backend.
+def _get_runtime() -> StorageRuntime:
+    """Return the configured runtime, defaulting to the current working directory."""
+    global _runtime  # noqa: PLW0603
+    if _runtime is None:
+        _runtime = StorageRuntime(Path.cwd())
+    return _runtime
+
+
+def _get_storage(scope: GraphScope = GraphScope.LOCAL_OVERLAY) -> StorageBackend:
+    """Lazily initialise and return the storage backend for *scope*.
 
     Looks for a ``.axon/kuzu`` directory in the current working directory.
     If it exists, the backend is initialised from that path.  Otherwise a
@@ -65,15 +82,27 @@ def _get_storage() -> KuzuBackend:
     called without crashing.
     """
     global _storage  # noqa: PLW0603
-    if _storage is None:
-        _storage = KuzuBackend()
-        db_path = Path.cwd() / ".axon" / "kuzu"
-        if db_path.exists():
-            _storage.initialize(db_path, read_only=True)
-            logger.info("Initialised storage (read-only) from %s", db_path)
+    runtime = _get_runtime()
+    location = runtime.location_for(scope)
+
+    global _shared_storage  # noqa: PLW0603
+
+    if scope is GraphScope.LOCAL_OVERLAY and _storage is not None:
+        return _storage
+    if scope is GraphScope.SHARED_CANONICAL and _shared_storage is not None:
+        return _shared_storage
+
+    if location.exists:
+        storage = runtime.open_storage(scope, read_only=True)
+        if scope is GraphScope.LOCAL_OVERLAY:
+            _storage = storage
         else:
-            logger.warning("No .axon/kuzu directory found in %s", Path.cwd())
-    return _storage
+            _shared_storage = storage
+        logger.info("Initialised %s storage (read-only) from %s", scope.value, location.path)
+        return storage
+
+    logger.warning("No %s storage directory found at %s", scope.value, location.path)
+    raise FileNotFoundError(f"No {scope.value} storage found at {location.path}")
 
 TOOLS: list[Tool] = [
     Tool(
@@ -102,6 +131,11 @@ TOOLS: list[Tool] = [
                     "description": "Maximum number of results (default 20).",
                     "default": 20,
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
+                },
             },
             "required": ["query"],
         },
@@ -118,6 +152,11 @@ TOOLS: list[Tool] = [
                 "symbol": {
                     "type": "string",
                     "description": "Name of the symbol to look up.",
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
                 },
             },
             "required": ["symbol"],
@@ -140,6 +179,11 @@ TOOLS: list[Tool] = [
                     "description": "Maximum traversal depth (default 3).",
                     "default": 3,
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
+                },
             },
             "required": ["symbol"],
         },
@@ -149,7 +193,13 @@ TOOLS: list[Tool] = [
         description="List all symbols detected as dead (unreachable) code.",
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
+                },
+            },
         },
     ),
     Tool(
@@ -165,6 +215,11 @@ TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Raw git diff output.",
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
+                },
             },
             "required": ["diff"],
         },
@@ -179,6 +234,11 @@ TOOLS: list[Tool] = [
                     "type": "string",
                     "description": "Cypher query string.",
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Graph scope: local_overlay or shared_canonical.",
+                    "default": GraphScope.LOCAL_OVERLAY.value,
+                },
             },
             "required": ["query"],
         },
@@ -190,7 +250,7 @@ async def list_tools() -> list[Tool]:
     """Return the list of available Axon tools."""
     return TOOLS
 
-def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
+def _dispatch_tool(name: str, arguments: dict, storage: StorageBackend) -> str:
     """Synchronous tool dispatch — called directly or via ``asyncio.to_thread``."""
     if name == "axon_list_repos":
         return handle_list_repos()
@@ -213,7 +273,13 @@ def _dispatch_tool(name: str, arguments: dict, storage: KuzuBackend) -> str:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch a tool call to the appropriate handler."""
-    storage = _get_storage()
+    try:
+        scope = parse_scope(arguments.get("scope"))
+        storage = _get_storage(scope)
+    except ValueError as exc:
+        return [TextContent(type="text", text=str(exc))]
+    except FileNotFoundError as exc:
+        return [TextContent(type="text", text=str(exc))]
 
     if _lock is not None:
         async with _lock:
@@ -247,7 +313,7 @@ async def list_resources() -> list[Resource]:
         ),
     ]
 
-def _dispatch_resource(uri_str: str, storage: KuzuBackend) -> str:
+def _dispatch_resource(uri_str: str, storage: StorageBackend) -> str:
     """Synchronous resource dispatch."""
     if uri_str == "axon://overview":
         return get_overview(storage)
@@ -261,7 +327,10 @@ def _dispatch_resource(uri_str: str, storage: KuzuBackend) -> str:
 @server.read_resource()
 async def read_resource(uri) -> str:
     """Read the contents of an Axon resource."""
-    storage = _get_storage()
+    try:
+        storage = _get_storage()
+    except FileNotFoundError as exc:
+        return str(exc)
     uri_str = str(uri)
 
     if _lock is not None:

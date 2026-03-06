@@ -14,26 +14,38 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from axon import __version__
+from axon.core.storage.runtime import GraphScope, StorageRuntime, parse_scope
 
 load_dotenv()
 
 console = Console()
 
-def _load_storage(repo_path: Path | None = None) -> "KuzuBackend":  # noqa: F821
-    """Load the KuzuDB backend for the given or current repo."""
-    from axon.core.storage.kuzu_backend import KuzuBackend
 
+def _read_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def _load_storage(
+    repo_path: Path | None = None,
+    *,
+    scope: GraphScope = GraphScope.LOCAL_OVERLAY,
+) -> "StorageBackend":  # noqa: F821
+    """Load storage for the given repo and graph scope."""
     target = (repo_path or Path.cwd()).resolve()
-    db_path = target / ".axon" / "kuzu"
-    if not db_path.exists():
+    runtime = StorageRuntime(target)
+    location = runtime.location_for(scope)
+    if not location.exists:
         console.print(
-            f"[red]Error:[/red] No index found at {target}. Run 'axon analyze' first."
+            f"[red]Error:[/red] No {scope.value} index found at {location.path}. "
+            "Run 'axon analyze' first or configure the shared graph path."
         )
         raise typer.Exit(code=1)
 
-    storage = KuzuBackend()
-    storage.initialize(db_path, read_only=True)
-    return storage
+    return runtime.open_storage(scope, read_only=True)
 
 app = typer.Typer(
     name="axon",
@@ -103,9 +115,11 @@ def analyze(
         )
 
     meta = {
+        **_read_json(axon_dir / "meta.json"),
         "version": __version__,
         "name": repo_path.name,
         "path": str(repo_path),
+        "repo_id": repo_path.name,
         "stats": {
             "files": result.files,
             "symbols": result.symbols,
@@ -117,6 +131,26 @@ def analyze(
         },
         "last_indexed_at": datetime.now(tz=timezone.utc).isoformat(),
     }
+    scopes = meta.get("scopes", {})
+    runtime = StorageRuntime(repo_path)
+    local_scope = scopes.get("local_overlay", {})
+    local_scope.update(
+        {
+            "backend": "kuzu",
+            "path": str(runtime.location_for(GraphScope.LOCAL_OVERLAY).path),
+            "ready": True,
+            "indexed": True,
+        }
+    )
+    scopes["local_overlay"] = local_scope
+    if "shared_canonical" not in scopes:
+        scopes["shared_canonical"] = {
+            "backend": "kuzu",
+            "path": str(runtime.location_for(GraphScope.SHARED_CANONICAL).path),
+            "ready": runtime.location_for(GraphScope.SHARED_CANONICAL).exists,
+            "indexed": False,
+        }
+    meta["scopes"] = scopes
     meta_path = axon_dir / "meta.json"
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
@@ -136,6 +170,36 @@ def analyze(
     console.print(f"  Duration:       {result.duration_seconds:.2f}s")
 
     storage.close()
+
+
+@app.command()
+def provision(
+    path: Path = typer.Argument(Path("."), help="Path to the repository to provision."),
+    index_local: bool = typer.Option(
+        True,
+        "--index-local/--skip-index-local",
+        help="Build the local overlay index immediately after provisioning.",
+    ),
+) -> None:
+    """Provision Axon's two-tier graph layout for a repository."""
+    from axon.core.storage.provisioning import provision_repo
+
+    repo_path = path.resolve()
+    if not repo_path.is_dir():
+        console.print(f"[red]Error:[/red] {repo_path} is not a directory.")
+        raise typer.Exit(code=1)
+
+    result = provision_repo(repo_path)
+
+    console.print(f"[bold]Provisioned[/bold] {repo_path}")
+    console.print(f"  Local overlay:     {result.local_path}")
+    console.print(f"  Shared canonical:  {result.shared_path}")
+    console.print(f"  Local meta:        {result.local_meta_path}")
+    console.print(f"  Shared meta:       {result.shared_meta_path}")
+
+    if index_local:
+        console.print("")
+        analyze(path=repo_path, full=True)
 
 @app.command()
 def status() -> None:
@@ -203,11 +267,17 @@ def clean(
 def query(
     q: str = typer.Argument(..., help="Search query for the knowledge graph."),
     limit: int = typer.Option(20, "--limit", "-n", help="Maximum number of results."),
+    scope: GraphScope = typer.Option(
+        GraphScope.LOCAL_OVERLAY,
+        "--scope",
+        help="Graph scope to query.",
+        case_sensitive=False,
+    ),
 ) -> None:
     """Search the knowledge graph."""
     from axon.mcp.tools import handle_query
 
-    storage = _load_storage()
+    storage = _load_storage(scope=parse_scope(scope))
     result = handle_query(storage, q, limit=limit)
     console.print(result)
     storage.close()
@@ -215,11 +285,17 @@ def query(
 @app.command()
 def context(
     name: str = typer.Argument(..., help="Symbol name to inspect."),
+    scope: GraphScope = typer.Option(
+        GraphScope.LOCAL_OVERLAY,
+        "--scope",
+        help="Graph scope to query.",
+        case_sensitive=False,
+    ),
 ) -> None:
     """Show 360-degree view of a symbol."""
     from axon.mcp.tools import handle_context
 
-    storage = _load_storage()
+    storage = _load_storage(scope=parse_scope(scope))
     result = handle_context(storage, name)
     console.print(result)
     storage.close()
@@ -228,21 +304,34 @@ def context(
 def impact(
     target: str = typer.Argument(..., help="Symbol to analyze blast radius for."),
     depth: int = typer.Option(3, "--depth", "-d", help="Traversal depth."),
+    scope: GraphScope = typer.Option(
+        GraphScope.LOCAL_OVERLAY,
+        "--scope",
+        help="Graph scope to query.",
+        case_sensitive=False,
+    ),
 ) -> None:
     """Show blast radius of changing a symbol."""
     from axon.mcp.tools import handle_impact
 
-    storage = _load_storage()
+    storage = _load_storage(scope=parse_scope(scope))
     result = handle_impact(storage, target, depth=depth)
     console.print(result)
     storage.close()
 
 @app.command(name="dead-code")
-def dead_code() -> None:
+def dead_code(
+    scope: GraphScope = typer.Option(
+        GraphScope.LOCAL_OVERLAY,
+        "--scope",
+        help="Graph scope to query.",
+        case_sensitive=False,
+    ),
+) -> None:
     """List all detected dead code."""
     from axon.mcp.tools import handle_dead_code
 
-    storage = _load_storage()
+    storage = _load_storage(scope=parse_scope(scope))
     result = handle_dead_code(storage)
     console.print(result)
     storage.close()
@@ -250,11 +339,17 @@ def dead_code() -> None:
 @app.command()
 def cypher(
     query: str = typer.Argument(..., help="Raw Cypher query to execute."),
+    scope: GraphScope = typer.Option(
+        GraphScope.LOCAL_OVERLAY,
+        "--scope",
+        help="Graph scope to query.",
+        case_sensitive=False,
+    ),
 ) -> None:
     """Execute raw Cypher against the knowledge graph."""
     from axon.mcp.tools import handle_cypher
 
-    storage = _load_storage()
+    storage = _load_storage(scope=parse_scope(scope))
     result = handle_cypher(storage, query)
     console.print(result)
     storage.close()
@@ -341,7 +436,7 @@ def serve(
     import asyncio
     import sys
 
-    from axon.mcp.server import main as mcp_main, set_lock, set_storage
+    from axon.mcp.server import main as mcp_main, set_lock, set_runtime, set_storage
 
     if not watch:
         asyncio.run(mcp_main())
@@ -364,6 +459,7 @@ def serve(
         run_pipeline(repo_path, storage, full=True)
 
     lock = asyncio.Lock()
+    set_runtime(StorageRuntime(repo_path))
     set_storage(storage)
     set_lock(lock)
 

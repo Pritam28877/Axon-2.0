@@ -48,6 +48,7 @@ class TestHelp:
         result = runner.invoke(app, ["--help"])
         expected_commands = [
             "analyze",
+            "provision",
             "status",
             "list",
             "clean",
@@ -102,6 +103,22 @@ class TestStatus:
         assert "10" in result.output  # files
         assert "42" in result.output  # symbols
         assert "100" in result.output  # relationships
+
+
+class TestProvision:
+    """Tests for the provision command."""
+
+    def test_provision_creates_two_tier_layout(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, ["provision", str(tmp_path), "--skip-index-local"])
+        assert result.exit_code == 0
+        assert (tmp_path / ".axon" / "meta.json").exists()
+        assert (tmp_path / ".axon" / "shared" / "meta.json").exists()
+        assert (tmp_path / ".axon" / "shared" / "manifests" / "active.json").exists()
+
+    def test_provision_errors_for_missing_path(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, ["provision", str(tmp_path / "missing"), "--skip-index-local"])
+        assert result.exit_code == 1
+        assert "is not a directory" in result.output
 
 
 class TestListRepos:
@@ -182,6 +199,23 @@ class TestQuery:
                 result = runner.invoke(app, ["query", "find classes"])
         assert result.exit_code == 0
         assert "MyClass" in result.output
+
+    def test_query_scope_is_forwarded(self, tmp_path: Path, monkeypatch: "pytest.MonkeyPatch") -> None:
+        """Query should accept explicit graph scope."""
+        monkeypatch.chdir(tmp_path)
+        mock_storage = MagicMock()
+        with patch("axon.cli.main._load_storage", return_value=mock_storage) as mock_load:
+            with patch(
+                "axon.mcp.tools.handle_query",
+                return_value="1. MyClass (Class) -- src/main.py",
+            ):
+                result = runner.invoke(
+                    app,
+                    ["query", "find classes", "--scope", "shared_canonical"],
+                )
+        assert result.exit_code == 0
+        mock_load.assert_called_once()
+        assert mock_load.call_args.kwargs["scope"].value == "shared_canonical"
 
 
 class TestContext:
