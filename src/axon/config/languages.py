@@ -200,10 +200,17 @@ for lang in LANGUAGES.values():
     for ext in lang.extensions:
         EXTENSION_MAP[ext] = lang.name
 
+SUPPORTED_EXTENSIONS = EXTENSION_MAP
+
+
+def get_language(file_path: str | Path) -> str | None:
+    """Return the language name for *file_path*, or ``None`` if unsupported."""
+    suffix = Path(file_path).suffix
+    return EXTENSION_MAP.get(suffix)
+
 def get_language_config(file_path: str | Path) -> LanguageConfig | None:
     """Return the configuration for the file's language."""
-    suffix = Path(file_path).suffix
-    lang_name = EXTENSION_MAP.get(suffix)
+    lang_name = get_language(file_path)
     return LANGUAGES.get(lang_name) if lang_name else None
 
 def is_supported(file_path: str | Path) -> bool:
